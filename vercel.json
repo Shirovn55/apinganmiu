@@ -1,6 +1,5 @@
 {
   "version": 2,
-  "name": "api-nganmiu",
   "builds": [
     {
       "src": "app.py",
@@ -12,8 +11,5 @@
       "src": "/(.*)",
       "dest": "app.py"
     }
-  ],
-  "env": {
-    "FLASK_ENV": "production"
-  }
+  ]
 }
