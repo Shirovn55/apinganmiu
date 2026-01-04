@@ -58,7 +58,6 @@ def _classify_shopee_failure(status_code: int, data_obj, raw_text: str):
     # Mặc định coi là lỗi tạm (để không đánh nhầm cookie die)
     return ("temp_error", msg or "Shopee error", 503)
 
-
 # Cache in-memory (simple dict)
 CACHE = {}
 CACHE_TTL = 7200  # 2 giờ
@@ -87,40 +86,60 @@ def verify_sheet_id(sheet_id: str) -> dict:
         if not creds_json:
             # Fallback: Cho phép tất cả nếu không có credentials
             return {"valid": True, "msg": "OK (no verification)"}
-
+        
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
-
+        
         creds_dict = json.loads(creds_json)
         credentials = service_account.Credentials.from_service_account_info(
             creds_dict,
             scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
         )
-
+        
         service = build('sheets', 'v4', credentials=credentials)
-
-        # Tab "Kích hoạt GGS"
-        spreadsheet_id = os.getenv("GOOGLE_SHEET_ID")
-        tab_name = "Kích hoạt GGS"
-
-        if not spreadsheet_id:
-            return {"valid": True, "msg": "OK (no GS_ID)"}
-
-        range_name = f"{tab_name}!A:A"  # sheet_id nằm cột A
+        
+        # Đọc tab "Kích hoạt GGS"
+        sheet_name = "Kích hoạt GGS"
+        range_name = f"{sheet_name}!A2:E1000"
+        
         result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
+            spreadsheetId=sheet_id,
             range=range_name
         ).execute()
-
-        values = result.get('values', [])
-        sheet_ids = [row[0].strip() for row in values if row and row[0]]
-
-        if sheet_id in sheet_ids:
-            return {"valid": True, "msg": "OK"}
-        else:
-            return {"valid": False, "msg": "Sheet chưa kích hoạt. Liên hệ admin."}
-
-    except Exception:
+        
+        rows = result.get('values', [])
+        
+        if not rows:
+            return {
+                "valid": False,
+                "msg": "🔒 Sheet chưa được kích hoạt.\n📞 Liên hệ: " + os.getenv("CONTACT_PHONE", "0819.555.000")
+            }
+        
+        # Tìm sheet_id trong cột B (index 1)
+        for row in rows:
+            if len(row) < 5:
+                continue
+            
+            row_sheet_id = row[1].strip() if len(row) > 1 else ""
+            status = row[4].strip() if len(row) > 4 else ""
+            
+            if row_sheet_id == sheet_id:
+                if status == "Đã kích hoạt":
+                    return {"valid": True, "msg": "OK"}
+                else:
+                    return {
+                        "valid": False,
+                        "msg": f"🔒 Sheet đang ở trạng thái: {status}\n📞 Liên hệ: " + os.getenv("CONTACT_PHONE", "0819.555.000")
+                    }
+        
+        # Không tìm thấy sheet_id
+        return {
+            "valid": False,
+            "msg": "🔒 Sheet chưa được kích hoạt.\n📞 Liên hệ: " + os.getenv("CONTACT_PHONE", "0819.555.000")
+        }
+        
+    except Exception as e:
+        print(f"⚠️ Error in verify_sheet_id: {e}")
         # Fallback: Cho phép nếu có lỗi (để không block user)
         return {"valid": True, "msg": "OK (error fallback)"}
 
@@ -245,10 +264,9 @@ def fetch_orders_and_details(cookie: str, limit: int = 50):
         "msg": "OK"
     }
 
-
 def fetch_order_detail(cookie: str, order_id: str):
     """
-    Lấy order detail từ Shopee
+    Lấy chi tiết 1 đơn
     """
     url = f"{BASE}/order/get_order_detail"
     headers = {
@@ -257,33 +275,34 @@ def fetch_order_detail(cookie: str, order_id: str):
         "referer": "https://shopee.vn/"
     }
     params = {"order_id": order_id}
-
+    
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         data = resp.json()
-
+        
         if data.get("error") != 0:
             return None
-
+        
         return data.get("data", {})
-
+        
     except:
         return None
 
-# (các hàm parse/utility bạn đang có giữ nguyên ở dưới)
+# ========== PARSE ORDER ==========
 def find_first_key(obj, key):
+    """Tìm key đầu tiên trong nested dict"""
     if isinstance(obj, dict):
         if key in obj:
             return obj[key]
         for v in obj.values():
-            found = find_first_key(v, key)
-            if found is not None:
-                return found
+            result = find_first_key(v, key)
+            if result is not None:
+                return result
     elif isinstance(obj, list):
         for item in obj:
-            found = find_first_key(item, key)
-            if found is not None:
-                return found
+            result = find_first_key(item, key)
+            if result is not None:
+                return result
     return None
 
 def pick_columns_from_detail(raw_data):
@@ -293,19 +312,25 @@ def pick_columns_from_detail(raw_data):
     """
     if not raw_data or not isinstance(raw_data, dict):
         return {}
-
+    
+    # Tracking number
     tracking_no = find_first_key(raw_data, "tracking_number") or \
                   find_first_key(raw_data, "tracking_no") or ""
-
-    buyer_name = find_first_key(raw_data, "recipient_name") or \
-                 find_first_key(raw_data, "name") or ""
-
-    buyer_phone = find_first_key(raw_data, "recipient_phone") or \
-                  find_first_key(raw_data, "phone") or ""
-
-    buyer_addr = find_first_key(raw_data, "full_address") or \
-                 find_first_key(raw_data, "address") or ""
-
+    
+    # Status
+    status_obj = find_first_key(raw_data, "list_view_text")
+    status_text = ""
+    if isinstance(status_obj, dict):
+        status_text = status_obj.get("text", "")
+    if not status_text:
+        status_text = find_first_key(raw_data, "status_label") or ""
+    
+    # Shipping info
+    shipping_name = find_first_key(raw_data, "shipping_name") or ""
+    shipping_phone = find_first_key(raw_data, "shipping_phone") or ""
+    shipping_address = find_first_key(raw_data, "shipping_address") or ""
+    
+    # Product name - ƯU TIÊN từ items
     product_name = ""
     try:
         parcel_cards = find_first_key(raw_data, "parcel_cards")
@@ -320,16 +345,81 @@ def pick_columns_from_detail(raw_data):
                     product_name = ", ".join(names)
     except:
         pass
-
+    
+    if not product_name:
+        product_name = "—"
+    
+    # COD - FIX: chia 100000
+    cod = 0
+    try:
+        final_total = find_first_key(raw_data, "final_total")
+        if final_total and isinstance(final_total, (int, float)) and final_total > 0:
+            cod = int(final_total / 100000)
+    except:
+        pass
+    
+    # Shipper
+    shipper_name = find_first_key(raw_data, "shipper_name") or \
+                   find_first_key(raw_data, "driver_name") or ""
+    shipper_phone = find_first_key(raw_data, "shipper_phone") or \
+                    find_first_key(raw_data, "driver_phone") or ""
+    
+    # Username
+    username = find_first_key(raw_data, "username") or ""
+    
     return {
         "tracking_no": tracking_no,
-        "buyer_name": buyer_name,
-        "buyer_phone": buyer_phone,
-        "buyer_addr": buyer_addr,
-        "product_name": product_name
+        "status_text": status_text,
+        "shipping_name": shipping_name,
+        "shipping_phone": shipping_phone,
+        "shipping_address": shipping_address,
+        "product_name": product_name,
+        "cod": cod,
+        "shipper_name": shipper_name,
+        "shipper_phone": shipper_phone,
+        "username": username
     }
 
-@app.route("/api/check-cookie-v2", methods=["POST"])
+def is_buyer_cancelled(raw_data):
+    """Check xem đơn có bị buyer cancel không"""
+    if not raw_data:
+        return False
+    
+    # Tìm cancel info
+    def tree_contains(obj, target):
+        if isinstance(obj, dict):
+            for v in obj.values():
+                if tree_contains(v, target):
+                    return True
+        elif isinstance(obj, list):
+            for v in obj:
+                if tree_contains(v, target):
+                    return True
+        elif isinstance(obj, str):
+            return obj == target
+        return False
+    
+    # Check order_status_text_cancelled_by_buyer
+    if tree_contains(raw_data, "order_status_text_cancelled_by_buyer"):
+        return True
+    
+    # Check cancel reason
+    cancel_by = find_first_key(raw_data, "cancel_by") or \
+                find_first_key(raw_data, "canceled_by") or ""
+    cancel_reason = find_first_key(raw_data, "cancel_reason") or \
+                    find_first_key(raw_data, "buyer_cancel_reason") or ""
+    
+    cancel_str = str(cancel_by).lower() + " " + str(cancel_reason).lower()
+    
+    if any(k in cancel_str for k in ["buyer", "user", "customer", "người mua"]):
+        if any(k in cancel_str for k in ["cancel", "hủy"]):
+            return True
+    
+    return False
+
+# ========== MAIN ENDPOINT ==========
+@app.route("/api/check-cookie-v2", methods=["POST","GET"])
+@app.route("/check-cookie-v2", methods=["POST","GET"])
 def check_cookie_v2():
     """
     API v2 - TRẠM TRUNG CHUYỂN
@@ -337,6 +427,14 @@ def check_cookie_v2():
     2) Gọi Shopee API
     3) Trả RAW DATA về cho GGScript tự parse (parseOrderResult)
     """
+    # Debug nhanh: mở URL trên trình duyệt sẽ thấy JSON này
+    if request.method == "GET":
+        return jsonify({
+            "ok": True,
+            "message": "API alive. Use POST with {cookie, sheet_id}.",
+            "endpoint": "/api/check-cookie-v2"
+        }), 200
+
     payload = request.get_json(silent=True) or {}
 
     cookie = (payload.get("cookie") or "").strip()
@@ -406,13 +504,12 @@ def check_cookie_v2():
         "cached": False
     }), 200
 
-
 # ========== ROOT ==========
 @app.route("/")
 def index():
     return jsonify({
         "name": "API NgânMiu FINAL",
-        "version": "2.0.1",
+        "version": "2.0.0",
         "endpoints": {
             "check_cookie_v2": "POST /api/check-cookie-v2 (with activation)"
         }
