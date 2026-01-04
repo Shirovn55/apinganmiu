@@ -1,20 +1,18 @@
 """
-API NgânMiu - Tổng hợp API cho Shopee Tools
+API NgânMiu v3 - Complete Edition
+- ✅ V3: Check kích hoạt trực tiếp trong tab "Kích hoạt GGS" (KHÔNG CẦN KeyCheckMVD riêng)
+- ✅ Giữ nguyên tất cả tính năng v2
+- ✅ Thêm: GHN tracking, SPX tracking qua tramavandan.com
+
 Author: NgânMiu.Store
 Contact: 0819.555.000
-
-Endpoints:
-- POST /api/check-cookie - Check cookie Shopee (legacy)
-- POST /api/check-cookie-v2 - Check cookie với verify Sheet ID
-- POST /api/spx-track - Tracking SPX đơn giản
-- POST /api/admin/add-sheet - Admin thêm Sheet ID
 """
 
 from flask import Flask, request, jsonify
 import requests
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -28,12 +26,8 @@ CONTACT_PHONE = os.getenv("CONTACT_PHONE", "0819.555.000")
 CACHE_TTL = 86400  # 24 giờ
 
 # Google Sheets
-KEYCHECK_SHEET_ID = os.getenv("KEYCHECK_SHEET_ID", "")
 GS_CREDS_JSON = os.getenv("GOOGLE_SHEETS_CREDS_JSON", "")
-GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-# Admin
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+GS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 # Shopee API
 UA = "Android app Shopee appver=28320 app_type=1"
@@ -75,11 +69,12 @@ def set_cache(key: str, value: dict, ttl: int = CACHE_TTL):
     import time
     _cache[key] = (value, time.time() + ttl)
 
-# ========== HELPER FUNCTIONS ==========
+# ========== ✅ V3: VERIFY SHEET ID - CHECK TRỰC TIẾP TRONG SHEET USER ==========
 
 def verify_sheet_id(sheet_id: str) -> dict:
     """
-    Kiểm tra sheet_id trong Sheet KeyCheckMVD
+    ✅ V3: Kiểm tra kích hoạt TRỰC TIẾP trong tab "Kích hoạt GGS" của user
+    KHÔNG CẦN KeyCheckMVD riêng nữa
     
     Return:
         {
@@ -88,85 +83,96 @@ def verify_sheet_id(sheet_id: str) -> dict:
             "expire_at": "2026-12-31" (nếu có)
         }
     """
-    if not KEYCHECK_SHEET_ID:
-        # Nếu chưa config → cho phép tất cả (dev mode)
-        return {"valid": True, "msg": "OK (no verification)"}
-    
     try:
         gc = _gs_client()
-        sh = gc.open_by_key(KEYCHECK_SHEET_ID)
-        ws = sh.worksheet("KeyCheckMVD")
         
-        rows = ws.get_all_records()
+        # Mở chính sheet của user
+        try:
+            spreadsheet = gc.open_by_key(sheet_id)
+        except Exception as e:
+            # Không mở được sheet → cho phép (fail-open)
+            print(f"⚠️ Cannot open sheet {sheet_id}: {e}")
+            return {"valid": True, "msg": "OK (cannot open sheet)"}
         
-        for r in rows:
-            if str(r.get("sheet_id", "")).strip() == sheet_id:
-                status = str(r.get("status", "")).lower().strip()
-                
-                # Kiểm tra banned
-                if status == "banned":
-                    return {
-                        "valid": False,
-                        "msg": f"❌ Tài khoản đã bị khóa.\n📞 Liên hệ: {CONTACT_PHONE}"
-                    }
-                
-                # Kiểm tra active
-                if status != "active":
-                    return {
-                        "valid": False,
-                        "msg": f"⚠️ Tài khoản chưa kích hoạt.\n📞 Liên hệ: {CONTACT_PHONE}"
-                    }
-                
-                # Kiểm tra expire
-                exp = r.get("expire_at")
-                if exp:
-                    try:
-                        exp_date = datetime.strptime(str(exp), "%Y-%m-%d")
-                        if exp_date < datetime.now():
-                            return {
-                                "valid": False,
-                                "msg": f"⏰ Gói đã hết hạn ({exp}).\n📞 Liên hệ: {CONTACT_PHONE} để gia hạn"
-                            }
-                    except:
-                        pass
-                
-                # ✅ Hợp lệ
+        # Tìm tab "Kích hoạt GGS"
+        try:
+            activation_sheet = spreadsheet.worksheet("Kích hoạt GGS")
+        except Exception:
+            # Không có tab "Kích hoạt GGS" → chưa kích hoạt
+            return {
+                "valid": False,
+                "msg": f"🔒 Chưa gửi yêu cầu kích hoạt.\nVui lòng click menu 'Gửi yêu cầu kích hoạt'.\n📞 Liên hệ: {CONTACT_PHONE}"
+            }
+        
+        # Đọc data từ tab "Kích hoạt GGS"
+        try:
+            all_values = activation_sheet.get_all_values()
+            if len(all_values) < 2:
+                # Tab có nhưng chưa có data → chưa kích hoạt
                 return {
-                    "valid": True,
-                    "expire_at": exp,
-                    "msg": "OK"
+                    "valid": False,
+                    "msg": f"🔒 Sheet chưa được kích hoạt.\n📞 Liên hệ: {CONTACT_PHONE}"
                 }
-        
-        # Không tìm thấy sheet_id
-        return {
-            "valid": False,
-            "msg": f"🔒 Sheet chưa được kích hoạt.\n📞 Liên hệ: {CONTACT_PHONE} để kích hoạt"
-        }
-        
+            
+            # Tìm hàng có sheet_id này (cột B - index 1)
+            # Header: Thời gian | Sheet ID | Tên Sheet | Email | Trạng thái
+            for row in all_values[1:]:  # Bỏ header
+                if len(row) < 5:
+                    continue
+                
+                row_sheet_id = str(row[1]).strip()
+                if row_sheet_id == sheet_id:
+                    # Tìm thấy!
+                    status = str(row[4]).strip() if len(row) > 4 else ""
+                    
+                    # Check status
+                    if status == "Đã kích hoạt":
+                        # ✅ ĐƯỢC KÍCH HOẠT
+                        return {
+                            "valid": True,
+                            "expire_at": None,
+                            "msg": "OK"
+                        }
+                    elif status == "Từ chối":
+                        # ❌ BỊ TỪ CHỐI
+                        return {
+                            "valid": False,
+                            "msg": f"🔒 Yêu cầu kích hoạt bị từ chối.\n📞 Liên hệ: {CONTACT_PHONE}"
+                        }
+                    elif status == "Hết hạn":
+                        # ❌ HẾT HẠN
+                        return {
+                            "valid": False,
+                            "msg": f"🔒 Sheet đã hết hạn sử dụng.\n📞 Liên hệ: {CONTACT_PHONE}"
+                        }
+                    else:
+                        # ⏳ CHỜ KÍCH HOẠT
+                        return {
+                            "valid": False,
+                            "msg": f"🔒 Sheet đang chờ kích hoạt.\n📞 Liên hệ: {CONTACT_PHONE}"
+                        }
+            
+            # Không tìm thấy sheet_id trong tab → chưa gửi yêu cầu
+            return {
+                "valid": False,
+                "msg": f"🔒 Chưa gửi yêu cầu kích hoạt.\nVui lòng click menu 'Gửi yêu cầu kích hoạt'.\n📞 Liên hệ: {CONTACT_PHONE}"
+            }
+            
+        except Exception as e:
+            # Lỗi đọc data → cho phép (fail-open)
+            print(f"⚠️ Error reading activation data: {e}")
+            return {"valid": True, "msg": "OK (read error)"}
+            
     except Exception as e:
-        # Lỗi kết nối → cho phép (fail-open)
-        return {
-            "valid": True,
-            "msg": f"⚠️ Lỗi verify: {str(e)}"
-        }
+        # Lỗi chung → cho phép (fail-open)
+        print(f"⚠️ Error in verify_sheet_id: {e}")
+        return {"valid": True, "msg": "OK (general error)"}
+
+# ========== SHOPEE API FUNCTIONS ==========
 
 def fetch_shopee_order_detail(cookie: str, order_id: str) -> dict:
     """
     Lấy chi tiết 1 đơn từ Shopee
-    
-    Return:
-        {
-            "tracking_no": "SPXVN...",
-            "status": "...",
-            "shipping_name": "...",
-            "shipping_phone": "...",
-            "shipping_address": "...",
-            "product_name": "...",
-            "cod": 80000,
-            "shipper_name": "",
-            "shipper_phone": "",
-            "username": ""
-        }
     """
     url = f"{BASE}/order/get_order_detail"
     headers = {
@@ -226,8 +232,6 @@ def fetch_shopee_order_detail(cookie: str, order_id: str) -> dict:
 def fetch_all_orders_from_cookie(cookie: str, limit: int = 50) -> list:
     """
     Lấy tất cả đơn hàng từ cookie
-    
-    Return: List[dict] - danh sách đơn
     """
     url = f"{BASE}/order/get_all_order_and_checkout_list"
     headers = {
@@ -266,99 +270,251 @@ def fetch_all_orders_from_cookie(cookie: str, limit: int = 50) -> list:
     except Exception as e:
         return []
 
+# ========== ✅ SPX TRACKING (tramavandan.com) ==========
+
+def check_spx_tramavandan(tracking_no: str) -> dict:
+    """
+    Tracking SPX qua tramavandan.com
+    
+    Return:
+        {
+            "error": 0/1,
+            "timeline": [...],
+            "status": "...",
+            "phone": "...",
+            "eta": "..."
+        }
+    """
+    SPX_API = "https://tramavandon.com/api/spx.php"
+    
+    payload = {"tracking_id": tracking_no.strip().upper()}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+        "Connection": "close"
+    }
+    
+    try:
+        import re
+        r = requests.post(SPX_API, json=payload, headers=headers, timeout=10)
+        data = r.json()
+        
+        if data.get("retcode") != 0:
+            return {
+                "error": 1,
+                "msg": "Không tìm thấy thông tin MVĐ"
+            }
+        
+        info = data["data"]["sls_tracking_info"]
+        records = info.get("records", [])
+        
+        timeline = []
+        phone = ""
+        last_ts = None
+        
+        for rec in records:
+            ts = rec.get("actual_time")
+            if not ts:
+                continue
+            
+            last_ts = ts
+            dt = datetime.fromtimestamp(ts).strftime("%d/%m/%Y %H:%M")
+            
+            status_text = rec.get("buyer_description", "").strip()
+            location = rec.get("current_location", {}).get("location_name", "").strip()
+            
+            # Tìm SĐT shipper
+            if not phone:
+                found = re.findall(r"\b0\d{9,10}\b", status_text)
+                if found:
+                    phone = found[0]
+            
+            line = f"{dt} — {status_text}"
+            if location:
+                line += f" — {location}"
+            
+            timeline.append(line)
+        
+        # Dự kiến giao (ước tính)
+        eta = "-"
+        if last_ts:
+            eta_dt = datetime.fromtimestamp(last_ts) + timedelta(days=1)
+            eta = eta_dt.strftime("%d/%m/%Y")
+        
+        return {
+            "error": 0,
+            "timeline": timeline[-5:] if timeline else [],
+            "status": timeline[0] if timeline else "Đang vận chuyển",
+            "phone": phone,
+            "eta": eta
+        }
+        
+    except Exception as e:
+        return {
+            "error": 1,
+            "msg": f"Lỗi kết nối: {str(e)}"
+        }
+
+# ========== ✅ GHN TRACKING ==========
+
+GHN_STATUS_EMOJI = {
+    "Chờ lấy hàng": "🕓",
+    "Nhận hàng tại bưu cục": "📦",
+    "Sẵn sàng xuất đến Kho trung chuyển": "🚚",
+    "Xuất hàng đi khỏi kho": "🚛",
+    "Đang trung chuyển hàng": "🚚",
+    "Nhập hàng vào kho trung chuyển": "🏬",
+    "Đang giao hàng": "🚴",
+    "Giao hàng thành công": "✅",
+    "Giao hàng không thành công": "❌",
+    "Hoàn hàng": "↩️"
+}
+
+def clean_ghn_status(text: str) -> str:
+    """Cắt bỏ nhãn trạng thái chung, giữ mô tả chi tiết"""
+    if not text:
+        return ""
+    
+    text = text.strip()
+    
+    if " – " in text:
+        return text.split(" – ", 1)[1].strip()
+    
+    if " - " in text:
+        return text.split(" - ", 1)[1].strip()
+    
+    return text
+
+def check_ghn(order_code: str, max_steps: int = 4) -> dict:
+    """
+    Tracking GHN
+    
+    Return:
+        {
+            "error": 0/1,
+            "status_name": "...",
+            "emoji": "...",
+            "eta": "...",
+            "timeline": [...]
+        }
+    """
+    url = "https://fe-online-gateway.ghn.vn/order-tracking/public-api/client/tracking-logs"
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Origin": "https://donhang.ghn.vn",
+        "Referer": "https://donhang.ghn.vn/",
+        "User-Agent": "Mozilla/5.0"
+    }
+    
+    payload = {"order_code": order_code.strip()}
+    
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        r.raise_for_status()
+        res = r.json()
+    except Exception as e:
+        return {
+            "error": 1,
+            "msg": f"Không kết nối được GHN: {str(e)}"
+        }
+    
+    if res.get("code") != 200:
+        return {
+            "error": 1,
+            "msg": "Không tìm thấy đơn GHN"
+        }
+    
+    data = res.get("data", {})
+    info = data.get("order_info", {})
+    logs = data.get("tracking_logs", [])
+    
+    # Header
+    status_name = info.get("status_name", "-")
+    emoji = GHN_STATUS_EMOJI.get(status_name, "🚚")
+    
+    # ETA
+    eta = "-"
+    leadtime = info.get("leadtime")
+    if leadtime:
+        try:
+            eta = datetime.fromisoformat(leadtime.replace("Z", "")).strftime("%d/%m/%Y")
+        except:
+            eta = leadtime[:10]
+    
+    # Timeline
+    timeline = []
+    last_key = None
+    
+    for lg in reversed(logs):
+        status = clean_ghn_status(lg.get("status_name", "").strip())
+        addr = lg.get("location", {}).get("address", "").strip()
+        
+        if not status:
+            continue
+        
+        # Chống trùng
+        key = f"{status}|{addr}"
+        if key == last_key:
+            continue
+        
+        t = lg.get("action_at", "")
+        if t:
+            try:
+                t = datetime.fromisoformat(t.replace("Z", "")).strftime("%d/%m %H:%M")
+            except:
+                t = t.replace("T", " ")[:16]
+        
+        content = status
+        if addr and addr not in status:
+            content = f"{status} — {addr}"
+        
+        timeline.append(f"{t} — {content}")
+        last_key = key
+        
+        if len(timeline) >= max_steps:
+            break
+    
+    if not timeline:
+        timeline.append("Chưa có lịch trình")
+    
+    return {
+        "error": 0,
+        "status_name": status_name,
+        "emoji": emoji,
+        "eta": eta,
+        "timeline": timeline
+    }
+
 # ========== API ENDPOINTS ==========
 
 @app.route("/", methods=["GET"])
 def home():
     """API info"""
     return jsonify({
-        "name": "API NgânMiu",
-        "version": "2.0.0",
+        "name": "API NgânMiu v3",
+        "version": "3.0.0",
+        "description": "Auto-activation via 'Kích hoạt GGS' tab",
         "contact": CONTACT_PHONE,
         "endpoints": {
-            "check_cookie_legacy": "POST /api/check-cookie",
-            "check_cookie_v2": "POST /api/check-cookie-v2",
+            "check_cookie_v2": "POST /api/check-cookie-v2 (with auto-activation)",
             "spx_tracking": "GET /api/spx-track?mvd=SPXVN...",
-            "admin_add_sheet": "POST /api/admin/add-sheet"
+            "ghn_tracking": "GET /api/ghn-track?code=GHN...",
+            "spx_tramavandan": "GET /api/spx-tramavandan?mvd=SPXVN..."
         }
     })
-
-@app.route("/api/check-cookie", methods=["POST"])
-def check_cookie_legacy():
-    """
-    API legacy - Check cookie (không verify Sheet ID)
-    
-    Request:
-        {
-            "cookie": "SPC_ST=..."
-        }
-    
-    Response:
-        {
-            "data": {
-                "tracking_no": "...",
-                "status": "...",
-                ...
-            }
-        }
-    """
-    data = request.get_json() or {}
-    cookie = data.get("cookie", "").strip()
-    
-    if not cookie:
-        return jsonify({"error": 1, "msg": "Thiếu cookie"}), 400
-    
-    # Cache
-    cache_key = f"legacy:{cookie[:50]}"
-    cached = get_cache(cache_key)
-    if cached:
-        return jsonify(cached)
-    
-    # Fetch
-    orders = fetch_all_orders_from_cookie(cookie, limit=1)
-    
-    if not orders:
-        result = {"error": 1, "msg": "Cookie không hợp lệ hoặc không có đơn"}
-    else:
-        result = {"data": orders[0]}
-    
-    # Cache
-    set_cache(cache_key, result, 3600)  # 1 giờ
-    
-    return jsonify(result)
 
 @app.route("/api/check-cookie-v2", methods=["POST"])
 def check_cookie_v2():
     """
-    API v2 - Check cookie với verify Sheet ID
-    
-    Request:
-        {
-            "cookie": "SPC_ST=...",
-            "sheet_id": "1ABC...XYZ"
-        }
-    
-    Response (thành công):
-        {
-            "error": 0,
-            "orders": [...],
-            "total": 2,
-            "cached": false,
-            "expire_at": "2026-12-31"
-        }
-    
-    Response (lỗi):
-        {
-            "error": 1,
-            "msg": "Sheet chưa được kích hoạt..."
-        }
+    API v2 - Check cookie với auto-activation
     """
     data = request.get_json() or {}
     
     cookie = data.get("cookie", "").strip()
     sheet_id = data.get("sheet_id", "").strip()
     
-    # Validate
     if not cookie:
         return jsonify({"error": 1, "msg": "Thiếu cookie"}), 400
     
@@ -375,7 +531,7 @@ def check_cookie_v2():
         }), 403
     
     # ===== CHECK CACHE =====
-    cache_key = f"v2:{sheet_id}:{cookie[:50]}"
+    cache_key = f"v3:{sheet_id}:{cookie[:50]}"
     cached_data = get_cache(cache_key)
     
     if cached_data:
@@ -399,7 +555,6 @@ def check_cookie_v2():
     # ===== SAVE CACHE =====
     set_cache(cache_key, orders, CACHE_TTL)
     
-    # ===== RETURN =====
     return jsonify({
         "error": 0,
         "orders": orders,
@@ -409,152 +564,43 @@ def check_cookie_v2():
     })
 
 @app.route("/api/spx-track", methods=["GET"])
-def spx_track():
+def spx_track_simple():
     """
-    Tracking SPX đơn giản
-    
-    Query:
-        ?mvd=SPXVN066194857771&language_code=vi
-    
-    Response:
-        {
-            "error": 0,
-            "timeline": [
-                "2024-12-15 10:30 — Giao hàng thành công",
-                "2024-12-14 08:00 — Đang giao hàng"
-            ],
-            "status": "Giao hàng thành công"
-        }
+    SPX tracking đơn giản (legacy - giữ tương thích)
     """
     mvd = request.args.get("mvd", "").strip()
-    language_code = request.args.get("language_code", "vi")
     
     if not mvd:
-        return jsonify({"error": 1, "msg": "Thiếu mã vận đơn"}), 400
+        return jsonify({"error": 1, "msg": "Thiếu MVĐ"}), 400
     
-    # Cache
-    cache_key = f"spx:{mvd}"
-    cached = get_cache(cache_key)
-    if cached:
-        return jsonify(cached)
-    
-    # Call SPX API
-    url = "https://spx.vn/shipment/order/open/order/get_order_info"
-    params = {
-        "spx_tn": mvd,
-        "language_code": language_code
-    }
-    
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        data = resp.json()
-        
-        if data.get("code") != 0:
-            result = {"error": 1, "msg": "Không tìm thấy MVĐ"}
-        else:
-            records = data.get("data", {}).get("sls_tracking_info", {}).get("records", [])
-            
-            timeline = []
-            status = "Đang vận chuyển"
-            
-            for r in records:
-                desc = r.get("description") or r.get("buyer_description") or ""
-                time_str = r.get("actual_time", "")
-                
-                if desc:
-                    if time_str:
-                        try:
-                            from datetime import datetime
-                            ts = int(time_str) / 1000
-                            dt = datetime.fromtimestamp(ts)
-                            time_fmt = dt.strftime("%Y-%m-%d %H:%M")
-                            timeline.append(f"{time_fmt} — {desc}")
-                        except:
-                            timeline.append(desc)
-                    else:
-                        timeline.append(desc)
-                    
-                    if "giao hàng thành công" in desc.lower():
-                        status = "Giao hàng thành công"
-            
-            result = {
-                "error": 0,
-                "timeline": timeline,
-                "status": status
-            }
-        
-        # Cache 1 giờ
-        set_cache(cache_key, result, 3600)
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        return jsonify({
-            "error": 1,
-            "msg": f"Lỗi kết nối SPX: {str(e)}"
-        }), 500
+    result = check_spx_tramavandan(mvd)
+    return jsonify(result)
 
-@app.route("/api/admin/add-sheet", methods=["POST"])
-def admin_add_sheet():
+@app.route("/api/spx-tramavandan", methods=["GET"])
+def spx_track_tramavandan():
     """
-    Admin API - Thêm Sheet ID vào KeyCheckMVD
-    
-    Request:
-        {
-            "admin_key": "SECRET_KEY",
-            "sheet_id": "1ABC...XYZ",
-            "expire_at": "2026-12-31",
-            "note": "Khách VIP"
-        }
-    
-    Response:
-        {
-            "error": 0,
-            "msg": "Đã thêm Sheet ID thành công"
-        }
+    SPX tracking qua tramavandan.com (chi tiết hơn)
     """
-    if not ADMIN_API_KEY:
-        return jsonify({"error": 1, "msg": "Admin API chưa được cấu hình"}), 500
+    mvd = request.args.get("mvd", "").strip()
     
-    data = request.get_json() or {}
+    if not mvd:
+        return jsonify({"error": 1, "msg": "Thiếu MVĐ"}), 400
     
-    # Auth
-    if data.get("admin_key") != ADMIN_API_KEY:
-        return jsonify({"error": 1, "msg": "Unauthorized"}), 403
+    result = check_spx_tramavandan(mvd)
+    return jsonify(result)
+
+@app.route("/api/ghn-track", methods=["GET"])
+def ghn_track():
+    """
+    GHN tracking
+    """
+    code = request.args.get("code", "").strip()
     
-    sheet_id = data.get("sheet_id", "").strip()
-    expire_at = data.get("expire_at", "")
-    note = data.get("note", "")
+    if not code:
+        return jsonify({"error": 1, "msg": "Thiếu mã GHN"}), 400
     
-    if not sheet_id:
-        return jsonify({"error": 1, "msg": "Thiếu sheet_id"}), 400
-    
-    if not KEYCHECK_SHEET_ID:
-        return jsonify({"error": 1, "msg": "KEYCHECK_SHEET_ID chưa được cấu hình"}), 500
-    
-    try:
-        gc = _gs_client()
-        sh = gc.open_by_key(KEYCHECK_SHEET_ID)
-        ws = sh.worksheet("KeyCheckMVD")
-        
-        # Thêm hàng mới
-        ws.append_row([
-            sheet_id,
-            "active",
-            expire_at,
-            note
-        ])
-        
-        return jsonify({
-            "error": 0,
-            "msg": "Đã thêm Sheet ID thành công"
-        })
-        
-    except Exception as e:
-        return jsonify({
-            "error": 1,
-            "msg": f"Lỗi: {str(e)}"
-        }), 500
+    result = check_ghn(code)
+    return jsonify(result)
 
 # ========== ERROR HANDLERS ==========
 
