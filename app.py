@@ -76,6 +76,8 @@ def verify_sheet_id(sheet_id: str) -> dict:
     ✅ V3: Kiểm tra kích hoạt TRỰC TIẾP trong tab "Kích hoạt GGS" của user
     KHÔNG CẦN KeyCheckMVD riêng nữa
     
+    QUAN TRỌNG: KHÔNG cache - phải check realtime để admin kích hoạt tức thì có hiệu lực
+    
     Return:
         {
             "valid": True/False,
@@ -547,10 +549,16 @@ def check_cookie_v2():
     orders = fetch_all_orders_from_cookie(cookie, limit=50)
     
     if not orders:
-        return jsonify({
-            "error": 1,
-            "msg": "Cookie không hợp lệ hoặc không có đơn hàng"
-        }), 400
+        # Cookie LIVE nhưng chưa có đơn → error=0 (không phải lỗi)
+        result = {
+            "error": 0,
+            "orders": [],
+            "total": 0,
+            "cached": False,
+            "msg": "Cookie hợp lệ nhưng chưa có đơn hàng"
+        }
+        set_cache(cache_key, result, 3600)  # Cache 1h cho trường hợp này
+        return jsonify(result)
     
     # ===== SAVE CACHE =====
     set_cache(cache_key, orders, CACHE_TTL)
