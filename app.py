@@ -233,7 +233,8 @@ def fetch_shopee_order_detail(cookie: str, order_id: str) -> dict:
 
 def fetch_all_orders_from_cookie(cookie: str, limit: int = 50) -> list:
     """
-    Lấy tất cả đơn hàng từ cookie
+    Lấy tất cả đơn hàng từ cookie (NGƯỜI MUA)
+    Logic từ API nganmiu.store (đang chạy tốt)
     """
     url = f"{BASE}/order/get_all_order_and_checkout_list"
     headers = {
@@ -247,22 +248,41 @@ def fetch_all_orders_from_cookie(cookie: str, limit: int = 50) -> list:
     }
     
     try:
+        # Bước 1: Lấy list order_id
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         data = resp.json()
         
         if data.get("error") != 0:
             return []
         
-        details = data.get("data", {}).get("details", [])
-        if not details:
+        # Lấy tất cả order_id từ response (BFS search)
+        order_ids = []
+        def extract_order_ids(obj):
+            if isinstance(obj, dict):
+                if "order_id" in obj and obj["order_id"]:
+                    order_ids.append(obj["order_id"])
+                for v in obj.values():
+                    extract_order_ids(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    extract_order_ids(item)
+        
+        extract_order_ids(data)
+        
+        # Loại bỏ trùng lặp
+        seen = set()
+        unique_ids = []
+        for oid in order_ids:
+            if oid not in seen:
+                seen.add(oid)
+                unique_ids.append(oid)
+        
+        if not unique_ids:
             return []
         
+        # Bước 2: Lấy chi tiết từng đơn
         orders = []
-        for detail in details:
-            order_id = detail.get("info", {}).get("order_id")
-            if not order_id:
-                continue
-            
+        for order_id in unique_ids[:limit]:
             order_detail = fetch_shopee_order_detail(cookie, order_id)
             if order_detail:
                 orders.append(order_detail)
@@ -270,6 +290,7 @@ def fetch_all_orders_from_cookie(cookie: str, limit: int = 50) -> list:
         return orders
         
     except Exception as e:
+        print(f"Error fetching orders: {e}")
         return []
 
 # ========== ✅ SPX TRACKING (tramavandan.com) ==========
